@@ -1,281 +1,178 @@
-"""
-Drop-in sliding window eval with pluggable mixer.
-
-Replaces the n-gram eval section in any train_gpt.py.
-Usage: import and call eval_sliding_with_mixer() instead of the default eval.
-
-Supports 3 mixing modes via MIXER_MODE env var:
-  - "linear"   (current SOTA, baseline comparison)
-  - "logistic"  (PAQ-style log-odds mixing)
-  - "ppmd"      (PPM-D blended order mixing + logistic)
-"""
+"""Sliding-window evaluation with optional n-gram mixing."""
 
 from __future__ import annotations
-
-import math
-import os
-import time
-
+import math, os, time
 import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import Tensor
-
-from mixer import (
-    CTWMixer,
-    PPMDMixer,
-    entropy_adaptive_alpha,
-    logistic_mix,
-    mix_predictions,
-)
+from mixer import PPMDMixer, entropy_adaptive_alpha, logistic_mix
 
 
-def eval_sliding_with_mixer(
-    model: torch.nn.Module,
-    val_tokens: Tensor,
-    base_bytes_lut: Tensor,
-    has_leading_space_lut: Tensor,
-    is_boundary_token_lut: Tensor,
-    device: torch.device,
-    seq_len: int = 1024,
-    stride: int = 64,
-    vocab_size: int = 1024,
-    # Mixer config
-    mixer_mode: str | None = None,
-    ngram_order: int = 7,
-    ngram_min_order: int = 2,
-    ngram_buckets: int = 4_194_304,
-    ngram_min_count: int = 2,
-    ngram_ent_base: float = 0.05,
-    ngram_ent_range: float = 0.55,
-    ngram_ent_scale: float = 2.0,
-    ngram_ent_thresh: float = 4.0,
-) -> tuple[float, float, dict]:
-    """Sliding window eval with pluggable probability mixer.
+def eval_sliding(model, val_tokens, base_bytes_lut, has_leading_space_lut,
+                 is_boundary_token_lut, device, seq_len=1024, stride=64,
+                 vocab_size=1024, mixer_mode=None, ngram_order=7,
+                 ngram_min_order=2, ngram_buckets=4_194_304, ngram_min_count=2,
+                 ent_base=0.05, ent_range=0.55, ent_scale=2.0, ent_thresh=4.0):
 
-    Returns:
-        val_loss: mean NLL (nats)
-        val_bpb: bits per byte
-        stats: dict with timing, hit rates, etc.
-    """
-    if mixer_mode is None:
-        mixer_mode = os.environ.get("MIXER_MODE", "logistic")
-
+    mixer_mode = mixer_mode or os.environ.get("MIXER_MODE", "logistic")
     total_tokens = val_tokens.numel() - 1
     val_np = val_tokens.cpu().numpy()
 
-    # Build window starts
     window_starts = [ws for ws in range(0, total_tokens, stride)
                      if min(ws + seq_len, total_tokens) - ws >= 1]
-
-    # Track which tokens have been scored (for score-first protocol)
     scored = np.zeros(total_tokens + 1, dtype=bool)
 
-    # Initialize mixer
     primes = [36313, 27191, 51647, 81929, 131071, 175447, 209591]
+    assert ngram_buckets & (ngram_buckets - 1) == 0
+    n_orders = ngram_order - ngram_min_order + 1
+    ng_mask = np.uint64(ngram_buckets - 1)
+    ng_primes = np.array(primes[:ngram_order], dtype=np.uint64)
 
-    if mixer_mode in ("linear", "logistic"):
-        # Use simple hash tables (same structure as current SOTA)
-        n_orders = ngram_order - ngram_min_order + 1
+    if mixer_mode == "ppmd":
+        ppmd = PPMDMixer(ngram_order, ngram_min_order, ngram_buckets, ngram_min_count, primes)
+    else:
         ctx_tables = [np.zeros(ngram_buckets, dtype=np.uint32) for _ in range(n_orders)]
         full_tables = [np.zeros(ngram_buckets, dtype=np.uint32) for _ in range(n_orders)]
-        ng_mask = np.uint64(ngram_buckets - 1)
-        ng_primes = np.array(primes[:ngram_order], dtype=np.uint64)
-    elif mixer_mode == "ppmd":
-        ppmd = PPMDMixer(
-            max_order=ngram_order,
-            min_order=ngram_min_order,
-            num_buckets=ngram_buckets,
-            min_count=ngram_min_count,
-            primes=primes,
-        )
 
-    # Accumulators
     loss_sum = torch.zeros((), device=device, dtype=torch.float64)
-    token_count = torch.zeros((), device=device, dtype=torch.float64)
+    tok_count = torch.zeros((), device=device, dtype=torch.float64)
     byte_count = torch.zeros((), device=device, dtype=torch.float64)
-
-    ngram_hits = 0
-    ngram_total = 0
+    hits, total = 0, 0
     t0 = time.time()
 
     model.eval()
-    compiled_logits = torch.compile(model.forward_logits, dynamic=False, fullgraph=True)
+    fwd = getattr(model, 'forward_logits', None)
+    if fwd is not None:
+        try:
+            fwd = torch.compile(fwd, dynamic=False, fullgraph=True)
+        except Exception:
+            pass  # compile not available, use uncompiled
 
     with torch.inference_mode():
         for wi, ws in enumerate(window_starts):
             wlen = min(ws + seq_len, total_tokens) - ws
-            x_batch = val_tokens[ws:ws + wlen].unsqueeze(0).to(device)
+            x = val_tokens[ws:ws + wlen].unsqueeze(0).to(device)
 
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                logits = compiled_logits(x_batch)  # (1, wlen, vocab)
+            if device.type == "cuda":
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    logits = (fwd or model)(x)
+            else:
+                logits = (fwd or model)(x)
 
-            y_batch = val_tokens[ws + 1:ws + wlen + 1].unsqueeze(0).to(device)
-            nll = F.cross_entropy(
-                logits.view(-1, logits.size(-1)),
-                y_batch.view(-1),
-                reduction="none",
-            ).view(1, -1)
+            y = val_tokens[ws + 1:ws + wlen + 1].unsqueeze(0).to(device)
+            nll = F.cross_entropy(logits.reshape(-1, logits.size(-1)),
+                                  y.reshape(-1), reduction="none").view(1, -1)
 
-            # Determine which tokens in this window are newly scored
             s = 0
             for j in range(wlen):
                 if not scored[ws + 1 + j]:
                     s = j
                     break
             else:
-                continue  # all tokens already scored
+                continue
 
-            # Score the new tokens
-            scored_nll = nll[0, s:wlen].to(torch.float64)
-            n_seg = scored_nll.numel()
-            global_j = np.arange(ws + s + 1, ws + wlen + 1, dtype=np.int64)
+            seg_nll = nll[0, s:wlen].to(torch.float64)
+            n_seg = seg_nll.numel()
+            gj = np.arange(ws + s + 1, ws + wlen + 1, dtype=np.int64)
 
-            # Compute model entropy for adaptive alpha
             with torch.no_grad():
                 lp = F.log_softmax(logits[0, s:wlen].float(), dim=-1)
                 seg_ent = -(lp.exp() * lp).sum(dim=-1).cpu().numpy()
 
-            # Get model probability for correct token
-            seg_nll_np = scored_nll.cpu().numpy()
-            seg_model_p = np.exp(-seg_nll_np)
+            seg_nll_np = seg_nll.cpu().numpy()
+            seg_p = np.exp(-seg_nll_np)
 
-            # --- MIXER APPLICATION ---
-            if mixer_mode in ("linear", "logistic"):
-                # Same hash-based n-gram as SOTA, but with configurable mixing
-                best_p_ng = np.full(n_seg, -1.0)
+            if mixer_mode == "ppmd":
+                p_ng, has = ppmd.predict_blended(val_np, gj, n_seg)
+                hits += has.sum()
+                total += n_seg
+                if has.any():
+                    a = np.clip(entropy_adaptive_alpha(seg_ent[has], ent_base, ent_range, ent_scale, ent_thresh), 0, 0.95)
+                    seg_p[has] = logistic_mix(seg_p[has], p_ng[has], a)
+                seg_nll_np = -np.log(np.clip(seg_p, 1e-12, 1.0))
+                ppmd.update_tables(val_np, int(gj[0]), int(gj[-1]) + 1)
 
+            else:
+                best = np.full(n_seg, -1.0)
                 for oi in range(n_orders):
-                    order = ngram_min_order + oi
-                    ctx_len = order - 1
-                    valid = global_j >= ctx_len
-                    if not valid.any():
-                        continue
-
-                    v_idx = np.nonzero(valid)[0]
-
-                    # Hash PRECEDING tokens (score-first: never include target)
-                    ctx_keys = np.zeros(len(v_idx), dtype=np.uint64)
+                    ctx_len = ngram_min_order + oi - 1
+                    valid = gj >= ctx_len
+                    if not valid.any(): continue
+                    vi = np.nonzero(valid)[0]
+                    ck = np.zeros(len(vi), dtype=np.uint64)
                     for k in range(ctx_len):
-                        tok_idx = np.clip(global_j[v_idx] - 1 - k, 0, len(val_np) - 1)
-                        ctx_keys ^= ng_primes[k] * val_np[tok_idx].astype(np.uint64)
-                    ctx_keys &= ng_mask
+                        ti = np.clip(gj[vi] - 1 - k, 0, len(val_np) - 1)
+                        ck ^= ng_primes[k] * val_np[ti].astype(np.uint64)
+                    ck &= ng_mask
+                    ti = np.clip(gj[vi], 0, len(val_np) - 1)
+                    pidx = min(ctx_len, len(ng_primes) - 1)
+                    fk = ck ^ (ng_primes[pidx] * val_np[ti].astype(np.uint64))
+                    fk &= ng_mask
+                    cc = ctx_tables[oi][ck].astype(np.float64)
+                    fc = full_tables[oi][fk].astype(np.float64)
+                    got = cc >= float(ngram_min_count)
+                    need = got & (best[vi] < 0)
+                    if need.any():
+                        fi = vi[need]
+                        best[fi] = np.clip(np.minimum(fc[need], cc[need]) / np.maximum(cc[need], 1.0), 0, 1)
 
-                    # Full key = context + target
-                    target_idx = np.clip(global_j[v_idx], 0, len(val_np) - 1)
-                    prime_idx = min(ctx_len, len(ng_primes) - 1)
-                    full_keys = ctx_keys ^ (ng_primes[prime_idx] * val_np[target_idx].astype(np.uint64))
-                    full_keys &= ng_mask
+                has = best >= 0
+                hits += has.sum()
+                total += n_seg
+                if has.any():
+                    a = np.clip(entropy_adaptive_alpha(seg_ent[has], ent_base, ent_range, ent_scale, ent_thresh), 0, 0.95)
+                    if mixer_mode == "logistic":
+                        seg_p[has] = logistic_mix(seg_p[has], best[has], a)
+                    else:
+                        seg_p[has] = (1.0 - a) * seg_p[has] + a * best[has]
+                seg_nll_np = -np.log(np.clip(seg_p, 1e-12, 1.0))
 
-                    ctx_counts = ctx_tables[oi][ctx_keys].astype(np.float64)
-                    full_counts = full_tables[oi][full_keys].astype(np.float64)
-
-                    has_match = ctx_counts >= float(ngram_min_count)
-                    needs_fill = has_match & (best_p_ng[v_idx] < 0)
-                    if needs_fill.any():
-                        fill_idx = v_idx[needs_fill]
-                        p = np.minimum(full_counts[needs_fill], ctx_counts[needs_fill]) / np.maximum(ctx_counts[needs_fill], 1.0)
-                        best_p_ng[fill_idx] = np.clip(p, 0.0, 1.0)
-
-                has_match_mask = best_p_ng >= 0
-                ngram_hits += has_match_mask.sum()
-                ngram_total += n_seg
-
-                if has_match_mask.any():
-                    alpha = np.clip(
-                        entropy_adaptive_alpha(seg_ent[has_match_mask], ngram_ent_base, ngram_ent_range, ngram_ent_scale, ngram_ent_thresh),
-                        0.0, 0.95,
-                    )
-
-                    if mixer_mode == "linear":
-                        seg_model_p[has_match_mask] = (1.0 - alpha) * seg_model_p[has_match_mask] + alpha * best_p_ng[has_match_mask]
-                    elif mixer_mode == "logistic":
-                        seg_model_p[has_match_mask] = logistic_mix(
-                            seg_model_p[has_match_mask],
-                            best_p_ng[has_match_mask],
-                            alpha,
-                        )
-
-                seg_nll_np = -np.log(np.clip(seg_model_p, 1e-12, 1.0))
-
-                # Update tables AFTER scoring (score-first protocol)
                 for oi in range(n_orders):
-                    order = ngram_min_order + oi
-                    ctx_len = order - 1
-                    for j_local in range(n_seg):
-                        j_global = int(global_j[j_local])
-                        if j_global < ctx_len:
-                            continue
+                    ctx_len = ngram_min_order + oi - 1
+                    for jl in range(n_seg):
+                        jg = int(gj[jl])
+                        if jg < ctx_len: continue
                         ck = np.uint64(0)
                         for k in range(ctx_len):
-                            ck ^= ng_primes[k] * np.uint64(val_np[j_global - 1 - k])
+                            ck ^= ng_primes[k] * np.uint64(val_np[jg - 1 - k])
                         ck &= ng_mask
-                        p_idx = min(ctx_len, len(ng_primes) - 1)
-                        fk = ck ^ (ng_primes[p_idx] * np.uint64(val_np[j_global]))
+                        pidx = min(ctx_len, len(ng_primes) - 1)
+                        fk = ck ^ (ng_primes[pidx] * np.uint64(val_np[jg]))
                         fk &= ng_mask
                         ctx_tables[oi][ck] += 1
                         full_tables[oi][fk] += 1
 
-            elif mixer_mode == "ppmd":
-                p_blend, has_match_mask = ppmd.predict_blended(val_np, global_j, n_seg)
-                ngram_hits += has_match_mask.sum()
-                ngram_total += n_seg
+            mixed = torch.from_numpy(seg_nll_np).to(device=device, dtype=torch.float64)
+            loss_sum += mixed.sum()
+            tok_count += n_seg
 
-                if has_match_mask.any():
-                    alpha = np.clip(
-                        entropy_adaptive_alpha(seg_ent[has_match_mask], ngram_ent_base, ngram_ent_range, ngram_ent_scale, ngram_ent_thresh),
-                        0.0, 0.95,
-                    )
-                    # PPM-D always uses logistic mixing
-                    seg_model_p[has_match_mask] = logistic_mix(
-                        seg_model_p[has_match_mask],
-                        p_blend[has_match_mask],
-                        alpha,
-                    )
+            tgt = val_np[gj].astype(np.int64)
+            prev = val_np[np.clip(gj - 1, 0, len(val_np) - 1)].astype(np.int64)
+            b = base_bytes_lut[tgt].cpu().numpy().astype(np.float64)
+            b += (has_leading_space_lut[tgt].cpu().numpy() &
+                  ~is_boundary_token_lut[prev].cpu().numpy()).astype(np.float64)
+            byte_count += b.sum()
 
-                seg_nll_np = -np.log(np.clip(seg_model_p, 1e-12, 1.0))
-                ppmd.update_tables(val_np, int(global_j[0]), int(global_j[-1]) + 1)
+            for jl in range(n_seg):
+                scored[int(gj[jl])] = True
 
-            # Accumulate loss
-            scored_nll_mixed = torch.from_numpy(seg_nll_np).to(device=device, dtype=torch.float64)
-            loss_sum += scored_nll_mixed.sum()
-            token_count += n_seg
-
-            # Byte counting
-            for j_local in range(n_seg):
-                j_global = int(global_j[j_local])
-                tgt_id = int(val_np[j_global])
-                prev_id = int(val_np[j_global - 1]) if j_global > 0 else 0
-                b = base_bytes_lut[tgt_id].item()
-                if has_leading_space_lut[tgt_id].item() and not is_boundary_token_lut[prev_id].item():
-                    b += 1
-                byte_count += b
-
-            # Mark scored
-            for j_local in range(n_seg):
-                scored[int(global_j[j_local])] = True
-
-            # Progress
             if (wi + 1) % 500 == 0:
                 elapsed = time.time() - t0
                 pct = (wi + 1) / len(window_starts) * 100
-                current_bpb = (loss_sum / token_count / math.log(2) * token_count / byte_count).item() if byte_count > 0 else 0
-                hit_rate = ngram_hits / max(ngram_total, 1) * 100
-                print(f"  [{mixer_mode}] {pct:.1f}% | bpb={current_bpb:.4f} | hits={hit_rate:.1f}% | {elapsed:.0f}s", flush=True)
+                bpb = (loss_sum / tok_count / math.log(2) * tok_count / byte_count).item() if byte_count > 0 else 0
+                hr = hits / max(total, 1) * 100
+                print(f"  [{mixer_mode}] {pct:.1f}% bpb={bpb:.4f} hits={hr:.1f}% {elapsed:.0f}s", flush=True)
 
-    val_loss = (loss_sum / token_count).item()
-    bits_per_token = val_loss / math.log(2.0)
-    tokens_per_byte = token_count.item() / byte_count.item()
-    val_bpb = bits_per_token * tokens_per_byte
-    elapsed = time.time() - t0
+    if tok_count == 0 or byte_count == 0:
+        return 0.0, 0.0, {}
 
-    stats = {
-        "mixer_mode": mixer_mode,
-        "val_loss": val_loss,
-        "val_bpb": val_bpb,
-        "ngram_hit_rate": ngram_hits / max(ngram_total, 1),
-        "tokens_scored": int(token_count.item()),
-        "eval_time_s": elapsed,
+    vl = (loss_sum / tok_count).item()
+    bpt = vl / math.log(2.0)
+    tpb = tok_count.item() / byte_count.item()
+
+    return vl, bpt * tpb, {
+        "mixer": mixer_mode, "val_loss": vl, "val_bpb": bpt * tpb,
+        "hit_rate": hits / max(total, 1), "tokens": int(tok_count.item()),
+        "time": time.time() - t0,
     }
-
-    return val_loss, val_bpb, stats
