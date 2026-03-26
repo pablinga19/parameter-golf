@@ -1,8 +1,6 @@
 """Probability mixers for n-gram eval cache."""
 
 from __future__ import annotations
-import math
-from typing import Optional
 import numpy as np
 
 
@@ -44,23 +42,6 @@ class PPMDMixer:
         self.ctx_tables = [np.zeros(num_buckets, dtype=np.uint32) for _ in range(self.n_orders)]
         self.full_tables = [np.zeros(num_buckets, dtype=np.uint32) for _ in range(self.n_orders)]
         self.unique_tables = [np.zeros(num_buckets, dtype=np.uint16) for _ in range(self.n_orders)]
-
-    def _hash_ctx(self, tokens, pos, order):
-        h = np.uint64(0)
-        for k in range(order):
-            idx = pos - 1 - k
-            if idx < 0:
-                return np.uint64(0xFFFFFFFFFFFFFFFF)
-            h ^= self.primes[k] * np.uint64(tokens[idx])
-        return h & self.mask
-
-    def _hash_full(self, tokens, pos, next_tok, order):
-        h = self._hash_ctx(tokens, pos, order)
-        if h == np.uint64(0xFFFFFFFFFFFFFFFF):
-            return h
-        pidx = min(order, len(self.primes) - 1)
-        h ^= self.primes[pidx] * np.uint64(next_tok)
-        return h & self.mask
 
     def predict_blended(self, val_np, global_j, n_seg):
         """Returns (p_blend, has_match) arrays."""
@@ -136,106 +117,3 @@ class PPMDMixer:
                     self.unique_tables[oi][ck] = min(65535, self.unique_tables[oi][ck] + 1)
                 self.ctx_tables[oi][ck] += 1
                 self.full_tables[oi][fk] += 1
-
-
-# experimental CTW variant, kept for comparison
-
-class KTEstimator:
-    __slots__ = ('counts', 'total', 'vs')
-    def __init__(self, vs=1024):
-        self.counts = {}
-        self.total = 0
-        self.vs = vs
-    def predict(self, tok):
-        return (self.counts.get(tok, 0) + 0.5) / (self.total + self.vs * 0.5)
-    def update(self, tok):
-        self.counts[tok] = self.counts.get(tok, 0) + 1
-        self.total += 1
-
-class HashedCTWNode:
-    __slots__ = ('kt', 'log_pe', 'log_pw')
-    def __init__(self, vs=1024):
-        self.kt = KTEstimator(vs)
-        self.log_pe = 0.0
-        self.log_pw = 0.0
-
-class CTWMixer:
-    """Hashed KT blend across depths."""
-
-    def __init__(self, max_depth=7, vocab_size=1024, num_buckets=1_048_576, primes=None):
-        assert num_buckets & (num_buckets - 1) == 0
-        self.max_depth = max_depth
-        self.vocab_size = vocab_size
-        self.num_buckets = num_buckets
-        self.mask = num_buckets - 1
-        self.primes = primes or [36313, 27191, 51647, 81929, 131071, 175447, 209591]
-        self.nodes = [{} for _ in range(max_depth + 1)]
-
-    def _hash(self, ctx, depth):
-        h = 0
-        for k in range(depth):
-            idx = len(ctx) - 1 - k
-            if idx < 0:
-                return -1
-            h ^= self.primes[k] * int(ctx[idx])
-        return h & self.mask
-
-    def _node(self, d, hk):
-        if hk not in self.nodes[d]:
-            self.nodes[d][hk] = HashedCTWNode(self.vocab_size)
-        return self.nodes[d][hk]
-
-    def predict(self, ctx, tok):
-        preds = []
-        for d in range(self.max_depth + 1):
-            h = 0 if d == 0 else self._hash(ctx, d)
-            if h < 0:
-                break
-            preds.append(self._node(d, h).kt.predict(tok))
-        if not preds:
-            return 1.0 / self.vocab_size
-        pw = preds[-1]
-        for d in range(len(preds) - 2, -1, -1):
-            pw = 0.5 * preds[d] + 0.5 * pw
-        return pw
-
-    def update(self, ctx, tok):
-        for d in range(self.max_depth + 1):
-            h = 0 if d == 0 else self._hash(ctx, d)
-            if h < 0:
-                break
-            self._node(d, h).kt.update(tok)
-
-    def predict_batch(self, val_np, global_j, n_seg):
-        p = np.zeros(n_seg)
-        m = np.ones(n_seg, dtype=bool)
-        for idx in range(n_seg):
-            j = int(global_j[idx])
-            if j <= 0 or j >= len(val_np):
-                p[idx] = 1.0 / self.vocab_size
-                continue
-            p[idx] = self.predict(val_np[max(0, j - self.max_depth):j], int(val_np[j]))
-        return p, m
-
-    def update_batch(self, val_np, start, end):
-        for j in range(start, end):
-            if j <= 0 or j >= len(val_np):
-                continue
-            self.update(val_np[max(0, j - self.max_depth):j], int(val_np[j]))
-
-
-def mix_predictions(p_neural, p_classical, has_match, ent,
-                    method="logistic", ab=0.05, ar=0.55, asc=2.0, at=4.0):
-    """Mix neural + classical predictions. Returns NLL array."""
-    out = p_neural.copy()
-    if has_match.any():
-        alpha = np.clip(entropy_adaptive_alpha(ent[has_match], ab, ar, asc, at), 0.0, 0.95)
-        if method == "linear":
-            out[has_match] = (1.0 - alpha) * p_neural[has_match] + alpha * p_classical[has_match]
-        elif method == "logistic":
-            out[has_match] = logistic_mix(p_neural[has_match], p_classical[has_match], alpha)
-        elif method == "adaptive":
-            boost = np.where(p_classical[has_match] > 0.5, 1.3, 1.0)
-            out[has_match] = logistic_mix(p_neural[has_match], p_classical[has_match],
-                                          np.clip(alpha * boost, 0.0, 0.95))
-    return -np.log(np.clip(out, 1e-12, 1.0))

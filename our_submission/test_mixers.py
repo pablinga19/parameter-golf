@@ -22,7 +22,6 @@ from mixer import (
     PPMDMixer,
     logistic_mix,
     entropy_adaptive_alpha,
-    mix_predictions,
 )
 
 # ---------------------------------------------------------------------------
