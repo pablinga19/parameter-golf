@@ -76,10 +76,9 @@ class PPMDMixer:
 
             vi = np.nonzero(valid)[0]
 
-            # hash preceding tokens only
             ck = np.zeros(len(vi), dtype=np.uint64)
             for k in range(ctx_len):
-                ti = np.clip(global_j[vi] - 1 - k, 0, len(val_np) - 1)
+                ti = np.clip(global_j[vi] - ctx_len + k, 0, len(val_np) - 1)
                 ck ^= self.primes[k] * val_np[ti].astype(np.uint64)
             ck &= self.mask
 
@@ -127,7 +126,7 @@ class PPMDMixer:
                     continue
                 ck = np.uint64(0)
                 for k in range(ctx_len):
-                    ck ^= self.primes[k] * np.uint64(val_np[j - 1 - k])
+                    ck ^= self.primes[k] * np.uint64(val_np[j - ctx_len + k])
                 ck &= self.mask
                 pidx = min(ctx_len, len(self.primes) - 1)
                 fk = ck ^ (self.primes[pidx] * np.uint64(nt))

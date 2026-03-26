@@ -20,7 +20,7 @@ def ppmd_update_batch(val_np, start, end, n_orders, min_order, primes, mask,
                 continue
             ck = np.uint64(0)
             for k in range(ctx_len):
-                ck ^= primes[k] * np.uint64(val_np[j - 1 - k])
+                ck ^= primes[k] * np.uint64(val_np[j - ctx_len + k])
             ck &= mask
             pidx = min(ctx_len, len(primes) - 1)
             fk = ck ^ (primes[pidx] * nt)
@@ -53,7 +53,7 @@ def ppmd_predict_batch(val_np, global_j, n_seg, n_orders, min_order, min_count,
                 continue
             ck = np.uint64(0)
             for k in range(ctx_len):
-                ck ^= primes[k] * np.uint64(val_np[j - 1 - k])
+                ck ^= primes[k] * np.uint64(val_np[j - ctx_len + k])
             ck &= mask
 
             cc = float(ctx_tables[oi][ck])
