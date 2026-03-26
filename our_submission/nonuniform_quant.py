@@ -32,6 +32,7 @@ def build_lloyd_max_codebook(weights_flat, n_levels=64, max_iter=50):
 
 
 def quantize_with_codebook(weights, codebook, per_row=True):
+    assert len(codebook) <= 256, f"codebook too large for uint8: {len(codebook)}"
     if per_row:
         assert weights.ndim == 2
         row_max = np.abs(weights).max(axis=1, keepdims=True)

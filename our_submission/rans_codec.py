@@ -6,6 +6,8 @@ RANS_L = 1 << 23
 
 
 def build_freq_table(data, num_symbols=63):
+    if data.size == 0:
+        raise ValueError("empty weight data")
     assert data.min() >= -31 and data.max() <= 31
     shifted = (data.astype(np.int32) + 31).ravel()
     counts = np.bincount(shifted, minlength=num_symbols).astype(np.int64)

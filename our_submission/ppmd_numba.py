@@ -78,6 +78,7 @@ def ppmd_predict_batch(val_np, global_j, n_seg, n_orders, min_order, min_count,
 class PPMDNumba:
     def __init__(self, max_order=7, min_order=2, num_buckets=4_194_304,
                  min_count=2, depth_boost_base=2.0):
+        assert max_order <= len(PRIMES), f"max_order {max_order} > {len(PRIMES)} primes"
         assert num_buckets & (num_buckets - 1) == 0
         self.max_order = max_order
         self.min_order = min_order

@@ -18,6 +18,9 @@ def entropy_adaptive_alpha(ent, base=0.05, range_=0.55, scale=2.0, thresh=4.0):
 class PPMDMixer:
     def __init__(self, max_order=7, min_order=2, num_buckets=4_194_304,
                  min_count=2, primes=None):
+        if primes is None:
+            primes = [36313, 27191, 51647, 81929, 131071, 175447, 209591]
+        assert max_order <= len(primes), f"max_order {max_order} > {len(primes)} primes"
         assert num_buckets & (num_buckets - 1) == 0
         self.max_order = max_order
         self.min_order = min_order
@@ -26,8 +29,6 @@ class PPMDMixer:
         self.mask = np.uint64(num_buckets - 1)
         self.n_orders = max_order - min_order + 1
 
-        if primes is None:
-            primes = [36313, 27191, 51647, 81929, 131071, 175447, 209591]
         self.primes = np.array(primes[:max_order], dtype=np.uint64)
 
         self.ctx_tables = [np.zeros(num_buckets, dtype=np.uint32) for _ in range(self.n_orders)]
