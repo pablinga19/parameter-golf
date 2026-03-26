@@ -1,11 +1,8 @@
-"""Probability mixers for n-gram eval cache."""
-
 from __future__ import annotations
 import numpy as np
 
 
 def logistic_mix(p_neural, p_ngram, alpha, eps=1e-7):
-    """Mix probabilities in log-odds space."""
     p_n = np.clip(p_neural, eps, 1.0 - eps)
     p_g = np.clip(p_ngram, eps, 1.0 - eps)
     logit_n = np.log(p_n / (1.0 - p_n))
@@ -19,15 +16,9 @@ def entropy_adaptive_alpha(ent, base=0.05, range_=0.55, scale=2.0, thresh=4.0):
 
 
 class PPMDMixer:
-    """PPM-D with blended orders instead of pure backoff.
-
-    Escape weight per order: unique / (total + unique).
-    Higher orders boosted exponentially.
-    """
-
     def __init__(self, max_order=7, min_order=2, num_buckets=4_194_304,
                  min_count=2, primes=None):
-        assert num_buckets & (num_buckets - 1) == 0, "buckets must be power of 2"
+        assert num_buckets & (num_buckets - 1) == 0
         self.max_order = max_order
         self.min_order = min_order
         self.num_buckets = num_buckets
@@ -44,7 +35,6 @@ class PPMDMixer:
         self.unique_tables = [np.zeros(num_buckets, dtype=np.uint16) for _ in range(self.n_orders)]
 
     def predict_blended(self, val_np, global_j, n_seg):
-        """Returns (p_blend, has_match) arrays."""
         order_p = np.full((self.n_orders, n_seg), -1.0)
         order_w = np.zeros((self.n_orders, n_seg))
 
@@ -54,7 +44,6 @@ class PPMDMixer:
             valid = global_j >= ctx_len
             if not valid.any():
                 continue
-
             vi = np.nonzero(valid)[0]
 
             ck = np.zeros(len(vi), dtype=np.uint64)
@@ -82,7 +71,6 @@ class PPMDMixer:
 
         has = np.any(order_p >= 0, axis=0)
         out = np.zeros(n_seg)
-
         if has.any():
             mi = np.nonzero(has)[0]
             tw = np.zeros(len(mi))
@@ -94,11 +82,10 @@ class PPMDMixer:
                     wp[ok] += w * order_p[oi, mi[ok]]
                     tw[ok] += w
             out[mi] = wp / np.maximum(tw, 1e-10)
-
         return out, has
 
     def update_tables(self, val_np, start, end):
-        """Update counts after scoring [start, end). Must be called AFTER scoring."""
+        # must be called AFTER scoring the segment
         for j in range(start, end):
             nt = val_np[j]
             for oi in range(self.n_orders):
@@ -112,7 +99,6 @@ class PPMDMixer:
                 pidx = min(ctx_len, len(self.primes) - 1)
                 fk = ck ^ (self.primes[pidx] * np.uint64(nt))
                 fk &= self.mask
-
                 if self.full_tables[oi][fk] == 0:
                     self.unique_tables[oi][ck] = min(65535, self.unique_tables[oi][ck] + 1)
                 self.ctx_tables[oi][ck] += 1

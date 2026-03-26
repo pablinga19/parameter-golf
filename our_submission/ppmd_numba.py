@@ -1,7 +1,4 @@
-"""Numba PPM-D mixer."""
-
 from __future__ import annotations
-import time
 import numpy as np
 from numba import njit, prange
 from numba.typed import List as NumbaList
@@ -25,7 +22,6 @@ def ppmd_update_batch(val_np, start, end, n_orders, min_order, primes, mask,
             pidx = min(ctx_len, len(primes) - 1)
             fk = ck ^ (primes[pidx] * nt)
             fk &= mask
-
             if full_tables[oi][fk] == 0:
                 if unique_tables[oi][ck] < 65535:
                     unique_tables[oi][ck] += 1
@@ -55,11 +51,9 @@ def ppmd_predict_batch(val_np, global_j, n_seg, n_orders, min_order, min_count,
             for k in range(ctx_len):
                 ck ^= primes[k] * np.uint64(val_np[j - ctx_len + k])
             ck &= mask
-
             cc = float(ctx_tables[oi][ck])
             if cc < float(min_count):
                 continue
-
             pidx = min(ctx_len, len(primes) - 1)
             fk = ck ^ (primes[pidx] * nt)
             fk &= mask
@@ -70,7 +64,6 @@ def ppmd_predict_batch(val_np, global_j, n_seg, n_orders, min_order, min_count,
             p = max(0.0, min(1.0, p))
             esc = uc / (cc + uc + 1e-10)
             w = (1.0 - esc) * depth_boost[oi]
-
             wp += w * p
             tw += w
             found = True
@@ -83,8 +76,6 @@ def ppmd_predict_batch(val_np, global_j, n_seg, n_orders, min_order, min_count,
 
 
 class PPMDNumba:
-    """Fast PPM-D. Same interface as PPMDMixer but jitted."""
-
     def __init__(self, max_order=7, min_order=2, num_buckets=4_194_304,
                  min_count=2, depth_boost_base=2.0):
         assert num_buckets & (num_buckets - 1) == 0
@@ -119,29 +110,3 @@ class PPMDNumba:
             val_np, start, end, self.n_orders, self.min_order,
             self.primes, self.mask,
             self.ctx_tables, self.full_tables, self.unique_tables)
-
-
-if __name__ == "__main__":
-    np.random.seed(42)
-    n = 500_000
-    tok = np.random.randint(0, 1024, size=n, dtype=np.int32)
-
-    m = PPMDNumba()
-    # warmup
-    m.update_tables(tok, 0, 1000)
-    gj = np.arange(100, 1000, dtype=np.int64)
-    m.predict_blended(tok, gj, len(gj))
-
-    m2 = PPMDNumba()
-    t0 = time.time()
-    m2.update_tables(tok, 0, n)
-    dt_u = time.time() - t0
-
-    gj = np.arange(10, n, dtype=np.int64)
-    t0 = time.time()
-    pb, hm = m2.predict_blended(tok, gj, len(gj))
-    dt_p = time.time() - t0
-
-    print(f"update: {n/dt_u:,.0f} tok/s  predict: {len(gj)/dt_p:,.0f} tok/s  "
-          f"hits: {hm.mean()*100:.1f}%")
-    print(f"62M projected: update {62e6/n*dt_u:.0f}s  predict {62e6/len(gj)*dt_p:.0f}s")
