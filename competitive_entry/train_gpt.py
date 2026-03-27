@@ -1142,6 +1142,14 @@ def eval_val_sliding(
     base_model.eval()
     compiled_logits = torch.compile(base_model.forward_logits, dynamic=False, fullgraph=True)
 
+    # for two-pass: store per-token model probs and entropy during pass 1
+    scored_model_p = None
+    scored_model_ent = None
+    if use_ngram and ngram_two_pass:
+        total_t = val_tokens.numel()
+        scored_model_p = np.zeros(total_t, dtype=np.float64)
+        scored_model_ent = np.zeros(total_t, dtype=np.float64)
+
     with torch.inference_mode():
         for bi in range(0, len(my_windows), batch_seqs):
             batch_ws = my_windows[bi:bi + batch_seqs]
@@ -1188,6 +1196,14 @@ def eval_val_sliding(
                         with torch.no_grad():
                             lp = F.log_softmax(logits[i, s:wlen].float(), dim=-1)
                             seg_ent = -(lp.exp() * lp).sum(dim=-1).cpu().numpy()
+
+                    # store for two-pass rescore
+                    if scored_model_p is not None:
+                        safe_j = global_j[global_j < len(scored_model_p)]
+                        n_safe = len(safe_j)
+                        scored_model_p[safe_j] = seg_model_p[:n_safe]
+                        if ngram_entropy:
+                            scored_model_ent[safe_j] = seg_ent[:n_safe]
 
                     # Precompute hashes for all orders
                     order_data = []  # (v_idx, ctx_key, full_key) per order
@@ -1281,85 +1297,98 @@ def eval_val_sliding(
     tokens_per_byte = token_count.item() / byte_count.item()
     val_bpb_pass1 = bits_per_token * tokens_per_byte
 
-    # two-pass rescore: use the fully-built cache to rescore all tokens
+    # two-pass rescore: use the fully-built cache to rescore all tokens (vectorized)
     if use_ngram and ngram_two_pass and rank == 0:
-        print(f"two_pass:starting pass2 with complete cache", flush=True)
+        print(f"two_pass:starting vectorized pass2", flush=True)
         t2_start = time.time()
         total = val_tokens.numel() - 1
 
-        # rebuild all hashes for every position, lookup in complete cache
-        pass2_loss = 0.0
-        pass2_bytes = 0.0
-        pass2_count = 0
+        # pass 1 already stored model probs via scored_model_p/scored_ent arrays
+        # if not available, collect them now via chunked eval
+        if 'scored_model_p' not in dir() or scored_model_p is None:
+            scored_model_p = np.zeros(total + 1, dtype=np.float64)
+            scored_model_ent = np.zeros(total + 1, dtype=np.float64)
+            with torch.inference_mode():
+                for wi, ws in enumerate(my_windows):
+                    wlen = min(ws + seq_len, total) - ws
+                    if wlen < 2: continue
+                    x_b = val_tokens[ws:ws+wlen].unsqueeze(0).to(device)
+                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                        lo = compiled_logits(x_b)
+                    lo_f = lo.float()
+                    y_b = val_tokens[ws+1:ws+wlen+1].to(device).long()
+                    nll = F.cross_entropy(lo_f[0,:wlen-1], y_b[:wlen-1], reduction="none")
+                    with torch.no_grad():
+                        lp = F.log_softmax(lo_f[0,:wlen-1], dim=-1)
+                        ent = -(lp.exp()*lp).sum(-1).cpu().numpy()
+                    nll_np = nll.cpu().numpy().astype(np.float64)
+                    positions = np.arange(ws+1, ws+1+len(nll_np))
+                    mask = (positions < total+1) & (scored_model_p[positions] == 0)
+                    scored_model_p[positions[mask]] = np.exp(-nll_np[mask])
+                    scored_model_ent[positions[mask]] = ent[mask]
+            print(f"two_pass:collected model probs ({(scored_model_p > 0).sum():,} scored) {time.time()-t2_start:.0f}s", flush=True)
+        else:
+            scored_model_ent = scored_ent if 'scored_ent' in dir() else np.zeros(total+1, dtype=np.float64)
 
-        # we need the stored model probabilities from pass 1
-        # recompute via sliding window (same as pass 1 but faster — no cache update)
-        scored_p = np.zeros(total, dtype=np.float64)
-        scored_ent = np.zeros(total, dtype=np.float64)
-        scored_bytecost = np.zeros(total, dtype=np.float64)
+        # byte costs (vectorized)
+        tgt_ids = val_np[1:total+1].astype(np.int64)
+        prev_ids = val_np[:total].astype(np.int64)
+        bytecost = base_bytes_lut[torch.from_numpy(tgt_ids).to(device)].cpu().numpy().astype(np.float64)
+        hs_arr = has_leading_space_lut[torch.from_numpy(tgt_ids).to(device)].cpu().numpy()
+        ib_arr = is_boundary_token_lut[torch.from_numpy(prev_ids).to(device)].cpu().numpy()
+        bytecost += (hs_arr & ~ib_arr).astype(np.float64)
 
-        with torch.inference_mode():
-            for wi, ws in enumerate(my_windows):
-                wlen = min(ws + seq_len, total) - ws
-                if wlen < 2:
-                    continue
-                x_batch = val_tokens[ws:ws + wlen].unsqueeze(0).to(device)
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                    lo = compiled_logits(x_batch)
-                lo_f = lo.float()
-                y_batch = val_tokens[ws + 1:ws + wlen + 1].to(device).long()
-                nll = F.cross_entropy(lo_f[0, :wlen - 1], y_batch[:wlen - 1], reduction="none")
-                with torch.no_grad():
-                    lp = F.log_softmax(lo_f[0, :wlen - 1], dim=-1)
-                    ent = -(lp.exp() * lp).sum(dim=-1).cpu().numpy()
-                nll_np = nll.cpu().numpy().astype(np.float64)
-                for j in range(len(nll_np)):
-                    pos = ws + 1 + j
-                    if pos < total and scored_p[pos] == 0:
-                        scored_p[pos] = np.exp(-nll_np[j])
-                        scored_ent[pos] = ent[j]
-                        tgt = int(val_np[pos])
-                        prev = int(val_np[pos - 1]) if pos > 0 else 0
-                        b = float(base_bytes_lut[tgt].item())
-                        if has_leading_space_lut[tgt].item() and not is_boundary_token_lut[prev].item():
-                            b += 1.0
-                        scored_bytecost[pos] = b
+        # vectorized rescore: compute hashes for all orders, backoff, blend
+        p_final = scored_model_p[1:total+1].copy()  # start with neural probs
+        matched = np.zeros(total, dtype=bool)
+        positions = np.arange(1, total + 1, dtype=np.int64)
 
-        # now rescore every position using the complete cache
-        for t in range(1, total):
-            if scored_p[t] <= 0 or scored_bytecost[t] <= 0:
+        for oi in range(_n_orders - 1, -1, -1):
+            ctx_w = ngram_min_order + oi - 1
+            valid = (positions >= ctx_w + 1) & (~matched)
+            if not valid.any():
                 continue
-            p_model = scored_p[t]
-            p_final = p_model
-            for oi in range(_n_orders - 1, -1, -1):
-                ctx_w = ngram_min_order + oi - 1
-                if t < ctx_w:
-                    continue
-                ctx_hash = np.uint64(0)
-                for k in range(ctx_w):
-                    ctx_hash ^= np.uint64(val_np[t - (ctx_w - k)]) * ng_primes[k % len(ng_primes)]
-                ctx_key = int(ctx_hash & ng_mask)
-                tgt_hash = ctx_hash ^ (np.uint64(val_np[t]) * ng_primes[ctx_w % len(ng_primes)])
-                full_key = int(tgt_hash & ng_mask)
+            vi = np.nonzero(valid)[0]
+            jv = positions[vi]
 
-                cc = float(ctx_tables[oi][ctx_key])
-                fc = float(full_tables[oi][full_key])
-                if cc >= float(ngram_min_count) and fc > 0:
-                    p_ng = min(fc, cc) / max(cc, 1.0)
-                    center = ngram_ent_thresh - ngram_center_shift * oi
-                    alpha = ngram_ent_base + ngram_ent_range / (1.0 + math.exp(-ngram_ent_scale * (scored_ent[t] - center)))
-                    mult = ngram_order_mults[oi] if oi < len(ngram_order_mults) else 2.0
-                    alpha = min(alpha * mult, 0.95)
-                    p_final = (1.0 - alpha) * p_model + alpha * p_ng
-                    break
+            ctx_hash = np.zeros(len(jv), dtype=np.uint64)
+            for k in range(ctx_w):
+                tok = val_np[jv - (ctx_w - k)].astype(np.uint64)
+                ctx_hash ^= tok * ng_primes[k % len(ng_primes)]
+            ctx_key = (ctx_hash & ng_mask).astype(np.int64)
+            tgt_np_v = val_np[jv].astype(np.uint64)
+            full_key = ((ctx_hash ^ (tgt_np_v * ng_primes[ctx_w % len(ng_primes)])) & ng_mask).astype(np.int64)
 
-            pass2_loss += -math.log(max(p_final, 1e-12)) * scored_bytecost[t]
-            pass2_bytes += scored_bytecost[t]
-            pass2_count += 1
+            cc = ctx_tables[oi][ctx_key].astype(np.float64)
+            fc = full_tables[oi][full_key].astype(np.float64)
+            has_hit = (cc >= float(ngram_min_count)) & (fc > 0)
+            if not has_hit.any():
+                continue
 
-        if pass2_bytes > 0:
-            pass2_bpb = (pass2_loss / pass2_bytes) / math.log(2.0)
-            print(f"two_pass:done pass2_bpb={pass2_bpb:.4f} tokens={pass2_count:,} time={time.time()-t2_start:.0f}s", flush=True)
+            hi = vi[has_hit]
+            p_ng = np.minimum(fc[has_hit], cc[has_hit]) / np.maximum(cc[has_hit], 1.0)
+
+            # OAEG alpha per token
+            center = ngram_ent_thresh - ngram_center_shift * oi
+            ent_vals = scored_model_ent[positions[hi]]
+            alpha = ngram_ent_base + ngram_ent_range / (1.0 + np.exp(-ngram_ent_scale * (ent_vals - center)))
+            mult = ngram_order_mults[oi] if oi < len(ngram_order_mults) else 2.0
+            alpha = np.clip(alpha * mult, 0.0, 0.95)
+
+            p_model_hi = scored_model_p[positions[hi]]
+            p_final[hi] = (1.0 - alpha) * p_model_hi + alpha * p_ng
+            matched[hi] = True
+
+        # compute BPB
+        valid_mask = (p_final > 0) & (bytecost > 0)
+        pass2_nll = -np.log(np.clip(p_final[valid_mask], 1e-12, 1.0))
+        pass2_bytes_total = bytecost[valid_mask].sum()
+        pass2_loss_total = (pass2_nll * bytecost[valid_mask]).sum()
+
+        if pass2_bytes_total > 0:
+            pass2_bpb = (pass2_loss_total / pass2_bytes_total) / math.log(2.0)
+            n_matched = matched.sum()
+            print(f"two_pass:done bpb={pass2_bpb:.4f} matched={n_matched:,}/{valid_mask.sum():,} ({n_matched/max(valid_mask.sum(),1)*100:.1f}%) {time.time()-t2_start:.0f}s", flush=True)
             base_model.train()
             return val_loss, pass2_bpb
 
