@@ -1235,6 +1235,7 @@ def eval_val_sliding(
 
                     # Multi-order backoff: highest order first, fill unmatched with lower orders
                     best_p_ng = np.full(n_seg, -1.0)
+                    wb_confidence = np.ones(n_seg)  # WB stay probability per token
                     for oi in range(_n_orders - 1, -1, -1):
                         if order_data[oi] is None:
                             continue
@@ -1248,8 +1249,8 @@ def eval_val_sliding(
                             p = np.minimum(full_counts[needs_fill], ctx_counts[needs_fill]) / np.maximum(ctx_counts[needs_fill], 1.0)
                             if use_wb_escape:
                                 uc = unique_tables[oi][ctx_key[needs_fill]].astype(np.float64)
-                                p_stay = ctx_counts[needs_fill] / (ctx_counts[needs_fill] + uc + 1e-10)
-                                p = p * p_stay
+                                wb_conf = ctx_counts[needs_fill] / (ctx_counts[needs_fill] + uc + 1e-10)
+                                wb_confidence[fill_idx] = wb_conf
                             best_p_ng[fill_idx] = np.clip(p, 0.0, 1.0)
 
                     # OAEG mix: per-order alpha with center shifts and multipliers
@@ -1277,6 +1278,9 @@ def eval_val_sliding(
                                     mult = ngram_order_mults[oi] if oi < len(ngram_order_mults) else 2.0
                                     alpha[mask] *= mult
                             alpha = np.clip(alpha, 0.0, 0.95)
+                            # WB: scale alpha by context confidence (avoids double-discounting)
+                            if use_wb_escape:
+                                alpha = alpha * wb_confidence[has_match]
                         else:
                             alpha = ngram_alpha
                         seg_model_p[has_match] = (1.0 - alpha) * seg_model_p[has_match] + alpha * best_p_ng[has_match]
@@ -1287,7 +1291,7 @@ def eval_val_sliding(
                             for L in phrase_lengths:
                                 if jg < L:
                                     continue
-                                pkey = hash(tuple(val_np[jg-L:jg].tolist()))
+                                pkey = tuple(val_np[jg-L:jg].tolist())
                                 if pkey in phrase_tables[L]:
                                     counts = phrase_tables[L][pkey]
                                     total_c = sum(counts.values())
@@ -1308,7 +1312,7 @@ def eval_val_sliding(
                             for L in phrase_lengths:
                                 if jg < L:
                                     continue
-                                pkey = hash(tuple(val_np[jg-L:jg].tolist()))
+                                pkey = tuple(val_np[jg-L:jg].tolist())
                                 if pkey not in phrase_tables[L]:
                                     phrase_tables[L][pkey] = {}
                                 phrase_tables[L][pkey][tgt] = phrase_tables[L][pkey].get(tgt, 0) + 1
