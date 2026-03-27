@@ -1,4 +1,5 @@
 from __future__ import annotations
+import math
 import numpy as np
 from numba import njit, prange
 from numba.typed import List as NumbaList
@@ -25,13 +26,11 @@ def ppmd_update_batch(val_np, start, end, n_orders, min_order, primes, mask,
 
             fc = full_tables[oi][fk]
             if fc == 0:
-                # new (context, token) pair — both unique and singleton
                 if unique_tables[oi][ck] < 65535:
                     unique_tables[oi][ck] += 1
                 if singleton_tables[oi][ck] < 65535:
                     singleton_tables[oi][ck] += 1
             elif fc == 1:
-                # was singleton, now seen twice — no longer singleton
                 if singleton_tables[oi][ck] > 0:
                     singleton_tables[oi][ck] -= 1
 
@@ -43,7 +42,7 @@ def ppmd_update_batch(val_np, start, end, n_orders, min_order, primes, mask,
 def ppmd_predict_batch(val_np, global_j, n_seg, n_orders, min_order, min_count,
                        primes, mask, ctx_tables, full_tables,
                        unique_tables, singleton_tables,
-                       depth_boost, use_singleton_escape):
+                       depth_boost, use_singleton_escape, count_gate_tau):
     p_out = np.zeros(n_seg, dtype=np.float64)
     has = np.zeros(n_seg, dtype=np.bool_)
 
@@ -74,19 +73,25 @@ def ppmd_predict_batch(val_np, global_j, n_seg, n_orders, min_order, min_count,
             p = max(0.0, min(1.0, p))
 
             if use_singleton_escape:
-                # PPM-D: escape = q1 / (2 * total)
                 q1 = float(singleton_tables[oi][ck])
                 esc = q1 / (2.0 * cc + 1e-10)
             else:
-                # PPM-C: escape = unique / (total + unique)
                 uc = float(unique_tables[oi][ck])
                 esc = uc / (cc + uc + 1e-10)
 
             esc = max(0.0, min(1.0, esc))
-            w = (1.0 - esc) * depth_boost[oi]
-            wp += w * p
-            tw += w
-            found = True
+
+            # count-gated weighting: dampen high orders until enough observations
+            if count_gate_tau > 0.0:
+                gate = 1.0 - math.exp(-cc / count_gate_tau)
+            else:
+                gate = 1.0
+
+            w = (1.0 - esc) * depth_boost[oi] * gate
+            if w > 1e-15:
+                wp += w * p
+                tw += w
+                found = True
 
         if found and tw > 1e-10:
             p_out[idx] = wp / tw
@@ -97,7 +102,8 @@ def ppmd_predict_batch(val_np, global_j, n_seg, n_orders, min_order, min_count,
 
 class PPMDNumba:
     def __init__(self, max_order=7, min_order=2, num_buckets=4_194_304,
-                 min_count=2, depth_boost_base=2.0, use_singleton_escape=True):
+                 min_count=2, depth_boost_base=2.0, use_singleton_escape=True,
+                 count_gate_tau=7.0):
         assert max_order <= len(PRIMES), f"max_order {max_order} > {len(PRIMES)} primes"
         assert num_buckets & (num_buckets - 1) == 0
         self.max_order = max_order
@@ -108,6 +114,7 @@ class PPMDNumba:
         self.mask = np.uint64(num_buckets - 1)
         self.primes = PRIMES[:max_order].copy()
         self.use_singleton_escape = use_singleton_escape
+        self.count_gate_tau = float(count_gate_tau)
 
         self.ctx_tables = NumbaList()
         self.full_tables = NumbaList()
@@ -128,7 +135,8 @@ class PPMDNumba:
             self.min_count, self.primes, self.mask,
             self.ctx_tables, self.full_tables,
             self.unique_tables, self.singleton_tables,
-            self.depth_boost, self.use_singleton_escape)
+            self.depth_boost, self.use_singleton_escape,
+            self.count_gate_tau)
 
     def update_tables(self, val_np, start, end):
         ppmd_update_batch(
