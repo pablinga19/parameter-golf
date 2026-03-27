@@ -1098,6 +1098,10 @@ def eval_val_sliding(
     ngram_center_shift = float(os.environ.get("NGRAM_CENTER_SHIFT", "0.25"))
     # two-pass mode
     ngram_two_pass = bool(int(os.environ.get("NGRAM_TWO_PASS", "0")))
+    # phrase cache: long exact match predictor (stage 2 blend after n-gram)
+    use_phrase_cache = bool(int(os.environ.get("PHRASE_CACHE", "0")))
+    phrase_lengths = [64, 56, 48, 36, 28, 20, 16]
+    phrase_tables = {L: {} for L in phrase_lengths} if use_phrase_cache else {}
     if use_ngram:
         val_np = val_tokens.cpu().numpy()
         _n_orders = ngram_order - ngram_min_order + 1
@@ -1126,6 +1130,10 @@ def eval_val_sliding(
         else:
             ctx_tables = [np.zeros((ngram_buckets,), dtype=np.uint32) for _ in range(_n_orders)]
             full_tables = [np.zeros((ngram_buckets,), dtype=np.uint32) for _ in range(_n_orders)]
+        # Witten-Bell: track unique next-tokens per context for escape probability
+        use_wb_escape = bool(int(os.environ.get("NGRAM_WB_ESCAPE", "0")))
+        if use_wb_escape:
+            unique_tables = [np.zeros((ngram_buckets,), dtype=np.uint16) for _ in range(_n_orders)]
         ng_mask = np.uint64(ngram_buckets - 1)
         ng_primes = np.array(
             [np.uint64(36313), np.uint64(27191), np.uint64(51647), np.uint64(81929),
@@ -1135,9 +1143,10 @@ def eval_val_sliding(
             dtype=np.uint64,
         )
         print(f"ngram_cache:enabled orders={ngram_min_order}-{ngram_order} backoff "
-              f"entropy={ngram_entropy} alpha={ngram_alpha} "
+              f"entropy={ngram_entropy} alpha={ngram_alpha} wb_escape={use_wb_escape} "
               f"ent_base={ngram_ent_base} ent_range={ngram_ent_range} "
-              f"min_count={ngram_min_count} buckets={ngram_buckets}", flush=True)
+              f"min_count={ngram_min_count} buckets={ngram_buckets} "
+              f"phrase_cache={use_phrase_cache}", flush=True)
 
     base_model.eval()
     compiled_logits = torch.compile(base_model.forward_logits, dynamic=False, fullgraph=True)
@@ -1237,6 +1246,10 @@ def eval_val_sliding(
                         if needs_fill.any():
                             fill_idx = v_idx[needs_fill]
                             p = np.minimum(full_counts[needs_fill], ctx_counts[needs_fill]) / np.maximum(ctx_counts[needs_fill], 1.0)
+                            if use_wb_escape:
+                                uc = unique_tables[oi][ctx_key[needs_fill]].astype(np.float64)
+                                p_stay = ctx_counts[needs_fill] / (ctx_counts[needs_fill] + uc + 1e-10)
+                                p = p * p_stay
                             best_p_ng[fill_idx] = np.clip(p, 0.0, 1.0)
 
                     # OAEG mix: per-order alpha with center shifts and multipliers
@@ -1267,13 +1280,49 @@ def eval_val_sliding(
                         else:
                             alpha = ngram_alpha
                         seg_model_p[has_match] = (1.0 - alpha) * seg_model_p[has_match] + alpha * best_p_ng[has_match]
+                    # phrase cache: long exact match blending (stage 2)
+                    if use_phrase_cache:
+                        for jl in range(n_seg):
+                            jg = int(global_j[jl])
+                            for L in phrase_lengths:
+                                if jg < L:
+                                    continue
+                                pkey = hash(tuple(val_np[jg-L:jg].tolist()))
+                                if pkey in phrase_tables[L]:
+                                    counts = phrase_tables[L][pkey]
+                                    total_c = sum(counts.values())
+                                    tgt = int(val_np[jg])
+                                    if tgt in counts and total_c >= 2:
+                                        p_phrase = counts[tgt] / total_c
+                                        alpha_p = min(0.95, 0.15 * (L / 64.0))
+                                        seg_model_p[jl] = (1.0 - alpha_p) * seg_model_p[jl] + alpha_p * p_phrase
+                                    break  # use longest match
+
                     seg_nll_np = -np.log(np.clip(seg_model_p, 1e-12, 1.0))
+
+                    # Score-first: update phrase cache AFTER scoring
+                    if use_phrase_cache:
+                        for jl in range(n_seg):
+                            jg = int(global_j[jl])
+                            tgt = int(val_np[jg])
+                            for L in phrase_lengths:
+                                if jg < L:
+                                    continue
+                                pkey = hash(tuple(val_np[jg-L:jg].tolist()))
+                                if pkey not in phrase_tables[L]:
+                                    phrase_tables[L][pkey] = {}
+                                phrase_tables[L][pkey][tgt] = phrase_tables[L][pkey].get(tgt, 0) + 1
 
                     # Score-first: update ALL order tables AFTER scoring
                     for oi in range(_n_orders):
                         if order_data[oi] is None:
                             continue
                         v_idx, ctx_key, full_key = order_data[oi]
+                        # Witten-Bell: track new (context, token) pairs
+                        if use_wb_escape:
+                            new_pairs = full_tables[oi][full_key] == 0
+                            if new_pairs.any():
+                                np.add.at(unique_tables[oi], ctx_key[new_pairs], 1)
                         np.add.at(ctx_tables[oi], ctx_key, 1)
                         np.add.at(full_tables[oi], full_key, 1)
 
