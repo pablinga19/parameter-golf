@@ -1475,43 +1475,42 @@ def eval_val_sliding(
                 fc = np.bincount(full_b, minlength=nbuckets).astype(np.float32)
                 skip_tables.append((offsets, cc, fc, nbuckets))
 
-            unmatched = np.nonzero(~matched)[0]
+            # vectorized skip-gram scoring for unmatched tokens
+            still_unmatched = ~matched
             for si, (offsets, cc, fc, nb) in enumerate(skip_tables):
-                if cc is None:
+                if cc is None or not still_unmatched.any():
                     continue
                 max_off = max(offsets)
                 smask = nb - 1
-                for ui in unmatched:
-                    pos = int(positions[ui])
-                    if pos < max_off:
-                        continue
-                    h = 0
-                    for j, off in enumerate(offsets):
-                        h ^= int(skip_primes[j]) * int(val_np[pos - off])
-                    cb = h & smask
-                    if cc[cb] < ngram_min_count:
-                        continue
-                    fh = (h ^ int(skip_primes[len(offsets)]) * int(val_np[pos])) & smask
-                    if fc[fh] > 0:
-                        p_skip = float(fc[fh]) / float(cc[cb])
-                        a_skip = 0.3 * skip_alpha_mults[si]
-                        p_final[ui] = (1.0 - a_skip) * p_final[ui] + a_skip * p_skip
-                        matched[ui] = True
-                        break
+                ui = np.nonzero(still_unmatched & (positions >= max_off))[0]
+                if len(ui) == 0:
+                    continue
+                pos_ui = positions[ui]
+                h = np.zeros(len(ui), dtype=np.int64)
+                for j, off in enumerate(offsets):
+                    h ^= int(skip_primes[j]) * val_np[pos_ui - off].astype(np.int64)
+                cb = (h & smask).astype(np.int32)
+                fh = ((h ^ int(skip_primes[len(offsets)]) * val_np[pos_ui].astype(np.int64)) & smask).astype(np.int32)
+                hit = (cc[cb] >= ngram_min_count) & (fc[fh] > 0)
+                if hit.any():
+                    hi = ui[hit]
+                    p_skip = fc[fh[hit]] / np.maximum(cc[cb[hit]], 1.0)
+                    a_skip = 0.3 * skip_alpha_mults[si]
+                    p_final[hi] = (1.0 - a_skip) * p_final[hi] + a_skip * p_skip
+                    still_unmatched[hi] = False
             print(f"two_pass:skip-grams done, matched={matched.sum():,}/{total:,}", flush=True)
 
         # KN unigram continuation counts (replaces raw unigram for unmatched tokens)
-        if use_kn_unigram:
+        if use_kn_unigram and len(val_np) >= 2:
             vocab_size = int(val_np.max()) + 1
             left_ctx_count = np.zeros(vocab_size, dtype=np.int32)
             v = val_np[:-1].astype(np.int64)
             w = val_np[1:].astype(np.int64)
-            pair_h = ((v * int(ng_primes[0])) ^ (w * int(ng_primes[1]))) % (ngram_buckets * 4)
-            order = np.argsort(pair_h)
-            pair_sorted = pair_h[order]
-            w_sorted = w[order]
-            is_new = np.concatenate([[True], pair_sorted[1:] != pair_sorted[:-1]])
-            w_new = w_sorted[is_new].astype(np.int32) % vocab_size
+            # exact pair dedup via lexsort (not hash-based)
+            sort_idx = np.lexsort((w, v))
+            v_s, w_s = v[sort_idx], w[sort_idx]
+            is_new = np.concatenate([[True], (v_s[1:] != v_s[:-1]) | (w_s[1:] != w_s[:-1])])
+            w_new = w_s[is_new].astype(np.int32) % vocab_size
             np.add.at(left_ctx_count, w_new, 1)
             total_lc = max(int(left_ctx_count.sum()), 1)
             # for unmatched tokens, use KN unigram as a soft floor
