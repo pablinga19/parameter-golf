@@ -1100,6 +1100,10 @@ def eval_val_sliding(
     ngram_two_pass = bool(int(os.environ.get("NGRAM_TWO_PASS", "0")))
     # phrase cache: long exact match predictor (stage 2 blend after n-gram)
     use_phrase_cache = bool(int(os.environ.get("PHRASE_CACHE", "0")))
+    use_hedge = bool(int(os.environ.get("HEDGE_MIXER", "0")))
+    hedge_beta = float(os.environ.get("HEDGE_BETA", "2.0"))
+    hedge_w = np.array([0.5, 0.5])
+    hedge_losses = np.zeros(2)
     phrase_lengths = [64, 56, 48, 36, 28, 20, 16]
     phrase_tables = {L: {} for L in phrase_lengths} if use_phrase_cache else {}
     if use_ngram:
@@ -1302,7 +1306,19 @@ def eval_val_sliding(
                                         seg_model_p[jl] = (1.0 - alpha_p) * seg_model_p[jl] + alpha_p * p_phrase
                                     break  # use longest match
 
-                    seg_nll_np = -np.log(np.clip(seg_model_p, 1e-12, 1.0))
+                    # Hedge mixer: blend pure neural + OAEG-mixed via EWA weights
+                    if use_hedge:
+                        p_neural_raw = np.exp(-scored_nll.cpu().numpy().astype(np.float64))
+                        p_mixed = seg_model_p
+                        p_hedge = hedge_w[0] * p_neural_raw + hedge_w[1] * p_mixed
+                        seg_nll_np = -np.log(np.clip(p_hedge, 1e-12, 1.0))
+                        # update hedge weights (score-first: based on what we just scored)
+                        hedge_losses[0] += -np.log(np.clip(p_neural_raw, 1e-12, 1.0)).sum()
+                        hedge_losses[1] += -np.log(np.clip(p_mixed, 1e-12, 1.0)).sum()
+                        raw_w = np.exp(-hedge_beta * (hedge_losses - hedge_losses.min()))
+                        hedge_w = raw_w / raw_w.sum()
+                    else:
+                        seg_nll_np = -np.log(np.clip(seg_model_p, 1e-12, 1.0))
 
                     # Score-first: update phrase cache AFTER scoring
                     if use_phrase_cache:
