@@ -981,7 +981,23 @@ class GPT(nn.Module):
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
             logits_proj = self.lm_head(x_flat)
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
-        main_loss = F.cross_entropy(logits.float(), targets, reduction="mean")
+
+        # complementary training: down-weight tokens the n-gram cache handles
+        comp_weight = float(os.environ.get("COMP_WEIGHT", "0"))
+        if comp_weight > 0 and hasattr(self, '_bigram_dominant') and self._bigram_dominant is not None:
+            per_tok = F.cross_entropy(logits.float(), targets, reduction="none")
+            input_flat = input_ids.reshape(-1)
+            prev_tokens = input_flat
+            curr_targets = targets
+            # check which tokens match the dominant bigram continuation
+            dom = self._bigram_dominant[prev_tokens.long()]
+            easy = (dom == curr_targets).float()
+            # easy tokens get weight 1/comp_weight, hard get comp_weight
+            w = torch.where(easy > 0.5, 1.0 / comp_weight, comp_weight)
+            w = w / w.mean()  # normalize
+            main_loss = (per_tok * w).mean()
+        else:
+            main_loss = F.cross_entropy(logits.float(), targets, reduction="mean")
 
         if self.training and self.mtp_num_heads > 0 and self.mtp_loss_weight > 0.0:
             _, seqlen, dim = x.shape
@@ -1069,7 +1085,7 @@ def eval_val_sliding(
     use_ngram = bool(int(os.environ.get("NGRAM_CACHE", _ngram_default)))
     ngram_alpha = float(os.environ.get("NGRAM_ALPHA", "0.40"))
     ngram_min_count = int(os.environ.get("NGRAM_MIN_COUNT", "2"))
-    ngram_order = int(os.environ.get("NGRAM_ORDER", "7"))
+    ngram_order = int(os.environ.get("NGRAM_ORDER", "12"))
     ngram_min_order = int(os.environ.get("NGRAM_MIN_ORDER", "2"))
     ngram_buckets = int(os.environ.get("NGRAM_BUCKETS", "4194304"))
     ngram_entropy = bool(int(os.environ.get("NGRAM_ENTROPY", "1")))
@@ -1080,12 +1096,31 @@ def eval_val_sliding(
     if use_ngram:
         val_np = val_tokens.cpu().numpy()
         _n_orders = ngram_order - ngram_min_order + 1
-        ctx_tables = [np.zeros((ngram_buckets,), dtype=np.uint32) for _ in range(_n_orders)]
-        full_tables = [np.zeros((ngram_buckets,), dtype=np.uint32) for _ in range(_n_orders)]
+        # warm cache: load pre-computed tables if available
+        warm_cache_path = os.environ.get("WARM_CACHE", "")
+        if warm_cache_path and os.path.exists(warm_cache_path):
+            import zstandard
+            with open(warm_cache_path, 'rb') as f:
+                raw = zstandard.ZstdDecompressor().decompress(f.read())
+            bpt = ngram_buckets * 4
+            ctx_tables = []
+            full_tables = []
+            off = 0
+            for _ in range(_n_orders):
+                ctx_tables.append(np.frombuffer(raw[off:off+bpt], dtype=np.uint32).copy())
+                off += bpt
+                full_tables.append(np.frombuffer(raw[off:off+bpt], dtype=np.uint32).copy())
+                off += bpt
+            print(f"warm_cache:loaded {warm_cache_path} ({len(raw)//1e6:.1f}MB decompressed)", flush=True)
+        else:
+            ctx_tables = [np.zeros((ngram_buckets,), dtype=np.uint32) for _ in range(_n_orders)]
+            full_tables = [np.zeros((ngram_buckets,), dtype=np.uint32) for _ in range(_n_orders)]
         ng_mask = np.uint64(ngram_buckets - 1)
         ng_primes = np.array(
             [np.uint64(36313), np.uint64(27191), np.uint64(51647), np.uint64(81929),
-             np.uint64(131071), np.uint64(175447), np.uint64(209591)],
+             np.uint64(131071), np.uint64(175447), np.uint64(209591), np.uint64(314159),
+             np.uint64(271828), np.uint64(577216), np.uint64(141421), np.uint64(173205),
+             np.uint64(223607), np.uint64(264575)],
             dtype=np.uint64,
         )
         print(f"ngram_cache:enabled orders={ngram_min_order}-{ngram_order} backoff "
@@ -1536,6 +1571,23 @@ def main() -> None:
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
+    # complementary training: pre-compute bigram dominance from training data
+    comp_weight = float(os.environ.get("COMP_WEIGHT", "0"))
+    if comp_weight > 0:
+        import glob as _g
+        train_files = sorted(_g.glob(args.train_files))
+        bigram_counts = np.zeros((args.vocab_size, args.vocab_size), dtype=np.float64)
+        for tf in train_files[:5]:  # sample first 5 shards for speed
+            toks = np.fromfile(tf, dtype=np.uint16)[:2_000_000]
+            for i in range(1, len(toks)):
+                if toks[i-1] < args.vocab_size and toks[i] < args.vocab_size:
+                    bigram_counts[toks[i-1], toks[i]] += 1
+        dominant = bigram_counts.argmax(axis=1).astype(np.int64)
+        base_model._bigram_dominant = torch.from_numpy(dominant).to(device)
+        log0(f"complementary_training:enabled comp_weight={comp_weight} sampled_bigrams={int(bigram_counts.sum())}")
+    else:
+        base_model._bigram_dominant = None
+
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False, static_graph=True) if distributed else compiled_model
 
