@@ -17,13 +17,14 @@ def build_cache_from_corpus(token_files, max_order=7, min_order=2,
     mask = np.uint64(num_buckets - 1)
     n_orders = max_order - min_order + 1
 
-    ctx_tables = [np.zeros(num_buckets, dtype=np.uint32) for _ in range(n_orders)]
-    full_tables = [np.zeros(num_buckets, dtype=np.uint32) for _ in range(n_orders)]
+    # uint64 during build to avoid overflow, downcast to uint32 after
+    ctx_tables = [np.zeros(num_buckets, dtype=np.uint64) for _ in range(n_orders)]
+    full_tables = [np.zeros(num_buckets, dtype=np.uint64) for _ in range(n_orders)]
 
     total_tokens = 0
     for fpath in token_files:
         tokens = np.fromfile(fpath, dtype=np.uint16)
-        for j in range(max_order, len(tokens)):
+        for j in range(min_order, len(tokens)):
             for oi in range(n_orders):
                 ctx_len = min_order + oi - 1
                 ck = np.uint64(0)
@@ -37,6 +38,9 @@ def build_cache_from_corpus(token_files, max_order=7, min_order=2,
                 full_tables[oi][int(fk)] += 1
         total_tokens += len(tokens)
 
+    # clip to uint32 range for storage
+    ctx_tables = [np.minimum(ct, np.iinfo(np.uint32).max).astype(np.uint32) for ct in ctx_tables]
+    full_tables = [np.minimum(ft, np.iinfo(np.uint32).max).astype(np.uint32) for ft in full_tables]
     return ctx_tables, full_tables, total_tokens
 
 
