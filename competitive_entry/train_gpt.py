@@ -1156,6 +1156,8 @@ def eval_val_sliding(
     compiled_logits = torch.compile(base_model.forward_logits, dynamic=False, fullgraph=True)
 
     # for two-pass: store per-token model probs and entropy during pass 1
+    # NOTE: under DDP, only rank 0's windows get filled. Pass 2 recomputes
+    # the rest on rank 0 via a full sliding window pass.
     scored_model_p = None
     scored_model_ent = None
     if use_ngram and ngram_two_pass:
@@ -1239,7 +1241,8 @@ def eval_val_sliding(
 
                     # Multi-order backoff: highest order first, fill unmatched with lower orders
                     best_p_ng = np.full(n_seg, -1.0)
-                    wb_confidence = np.ones(n_seg)  # WB stay probability per token
+                    best_order_idx = np.full(n_seg, -1, dtype=np.int32)
+                    wb_confidence = np.ones(n_seg)
                     for oi in range(_n_orders - 1, -1, -1):
                         if order_data[oi] is None:
                             continue
@@ -1256,20 +1259,10 @@ def eval_val_sliding(
                                 wb_conf = ctx_counts[needs_fill] / (ctx_counts[needs_fill] + uc + 1e-10)
                                 wb_confidence[fill_idx] = wb_conf
                             best_p_ng[fill_idx] = np.clip(p, 0.0, 1.0)
+                            best_order_idx[fill_idx] = oi
 
                     # OAEG mix: per-order alpha with center shifts and multipliers
                     has_match = best_p_ng >= 0
-                    best_order_idx = np.full(n_seg, -1)  # track which order won
-                    for oi in range(_n_orders - 1, -1, -1):
-                        if order_data[oi] is None:
-                            continue
-                        v_idx, ctx_key, full_key = order_data[oi]
-                        ctx_counts = ctx_tables[oi][ctx_key].astype(np.float64)
-                        matched = ctx_counts >= float(ngram_min_count)
-                        filled = matched & (best_order_idx[v_idx] < 0)
-                        if filled.any():
-                            best_order_idx[v_idx[filled]] = oi
-
                     if has_match.any():
                         if ngram_entropy:
                             oi_per_tok = best_order_idx[has_match]
@@ -1372,32 +1365,32 @@ def eval_val_sliding(
         t2_start = time.time()
         total = val_tokens.numel() - 1
 
-        # pass 1 already stored model probs via scored_model_p/scored_ent arrays
-        # if not available, collect them now via chunked eval
-        if 'scored_model_p' not in dir() or scored_model_p is None:
-            scored_model_p = np.zeros(total + 1, dtype=np.float64)
-            scored_model_ent = np.zeros(total + 1, dtype=np.float64)
-            with torch.inference_mode():
-                for wi, ws in enumerate(my_windows):
-                    wlen = min(ws + seq_len, total) - ws
-                    if wlen < 2: continue
-                    x_b = val_tokens[ws:ws+wlen].unsqueeze(0).to(device)
-                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                        lo = compiled_logits(x_b)
-                    lo_f = lo.float()
-                    y_b = val_tokens[ws+1:ws+wlen+1].to(device).long()
-                    nll = F.cross_entropy(lo_f[0,:wlen-1], y_b[:wlen-1], reduction="none")
-                    with torch.no_grad():
-                        lp = F.log_softmax(lo_f[0,:wlen-1], dim=-1)
-                        ent = -(lp.exp()*lp).sum(-1).cpu().numpy()
-                    nll_np = nll.cpu().numpy().astype(np.float64)
-                    positions = np.arange(ws+1, ws+1+len(nll_np))
-                    mask = (positions < total+1) & (scored_model_p[positions] == 0)
-                    scored_model_p[positions[mask]] = np.exp(-nll_np[mask])
-                    scored_model_ent[positions[mask]] = ent[mask]
-            print(f"two_pass:collected model probs ({(scored_model_p > 0).sum():,} scored) {time.time()-t2_start:.0f}s", flush=True)
-        else:
-            scored_model_ent = scored_ent if 'scored_ent' in dir() else np.zeros(total+1, dtype=np.float64)
+        # rank 0 recomputes model probs for ALL tokens (not just its DDP partition)
+        # this ensures pass 2 has complete coverage
+        all_windows = window_starts  # full list, not rank-partitioned my_windows
+        scored_model_p = np.zeros(total + 1, dtype=np.float64)
+        scored_model_ent = np.zeros(total + 1, dtype=np.float64)
+        print(f"two_pass:collecting model probs for {total:,} tokens...", flush=True)
+        with torch.inference_mode():
+            for wi, ws in enumerate(all_windows):
+                wlen = min(ws + seq_len, total) - ws
+                if wlen < 2: continue
+                x_b = val_tokens[ws:ws+wlen].unsqueeze(0).to(device)
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                    lo = compiled_logits(x_b)
+                lo_f = lo.float()
+                y_b = val_tokens[ws+1:ws+wlen+1].to(device).long()
+                nll = F.cross_entropy(lo_f[0,:wlen-1], y_b[:wlen-1], reduction="none")
+                with torch.no_grad():
+                    lp = F.log_softmax(lo_f[0,:wlen-1], dim=-1)
+                    ent = -(lp.exp()*lp).sum(-1).cpu().numpy()
+                nll_np = nll.cpu().numpy().astype(np.float64)
+                positions = np.arange(ws+1, ws+1+len(nll_np))
+                mask = (positions < total+1) & (scored_model_p[positions] == 0)
+                scored_model_p[positions[mask]] = np.exp(-nll_np[mask])
+                scored_model_ent[positions[mask]] = ent[mask]
+        n_scored = (scored_model_p > 0).sum()
+        print(f"two_pass:collected {n_scored:,}/{total:,} tokens ({n_scored/total*100:.1f}%) {time.time()-t2_start:.0f}s", flush=True)
 
         # byte costs (vectorized)
         tgt_ids = val_np[1:total+1].astype(np.int64)
