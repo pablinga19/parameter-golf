@@ -68,6 +68,8 @@ def ppmd_predict_batch(val_np, global_j, n_seg, n_orders, min_order, min_count,
             fk = ck ^ (primes[pidx] * nt)
             fk &= mask
             fc = float(full_tables[oi][fk])
+            if fc < 1.0:
+                continue  # token never seen in this context — skip, don't dilute
 
             p = min(fc, cc) / max(cc, 1.0)
             p = max(0.0, min(1.0, p))
@@ -102,7 +104,7 @@ def ppmd_predict_batch(val_np, global_j, n_seg, n_orders, min_order, min_count,
 
 class PPMDNumba:
     def __init__(self, max_order=7, min_order=2, num_buckets=4_194_304,
-                 min_count=2, depth_boost_base=2.0, use_singleton_escape=True,
+                 min_count=2, depth_boost_base=1.2, use_singleton_escape=True,
                  count_gate_tau=7.0):
         assert max_order <= len(PRIMES), f"max_order {max_order} > {len(PRIMES)} primes"
         assert num_buckets & (num_buckets - 1) == 0

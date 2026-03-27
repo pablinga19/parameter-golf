@@ -63,7 +63,7 @@ class PPMDMixer:
             cc = self.ctx_tables[oi][ck].astype(np.float64)
             fc = self.full_tables[oi][fk].astype(np.float64)
 
-            got = cc >= float(self.min_count)
+            got = (cc >= float(self.min_count)) & (fc > 0)  # skip zero-prob orders
             if got.any():
                 mi = vi[got]
                 p = np.minimum(fc[got], cc[got]) / np.maximum(cc[got], 1.0)
