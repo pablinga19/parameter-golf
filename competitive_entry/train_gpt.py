@@ -1088,9 +1088,16 @@ def eval_val_sliding(
     ngram_buckets = int(os.environ.get("NGRAM_BUCKETS", "4194304"))
     ngram_entropy = bool(int(os.environ.get("NGRAM_ENTROPY", "1")))
     ngram_ent_base = float(os.environ.get("NGRAM_ENT_BASE", "0.05"))
-    ngram_ent_range = float(os.environ.get("NGRAM_ENT_RANGE", "0.55"))
+    ngram_ent_range = float(os.environ.get("NGRAM_ENT_RANGE", "0.65"))
     ngram_ent_scale = float(os.environ.get("NGRAM_ENT_SCALE", "2.0"))
-    ngram_ent_thresh = float(os.environ.get("NGRAM_ENT_THRESH", "4.0"))
+    ngram_ent_thresh = float(os.environ.get("NGRAM_ENT_THRESH", "3.0"))
+    # OAEG: per-order multipliers — suppress noisy low orders, boost high orders
+    _order_mults_str = os.environ.get("NGRAM_ORDER_MULTS", "0.3,0.3,0.97,2.0,2.0,2.0,2.0,2.0,2.0,2.0,2.0")
+    ngram_order_mults = [float(x) for x in _order_mults_str.split(",")]
+    # OAEG: per-order entropy center shift (higher orders activate at lower entropy)
+    ngram_center_shift = float(os.environ.get("NGRAM_CENTER_SHIFT", "0.25"))
+    # two-pass mode
+    ngram_two_pass = bool(int(os.environ.get("NGRAM_TWO_PASS", "0")))
     if use_ngram:
         val_np = val_tokens.cpu().numpy()
         _n_orders = ngram_order - ngram_min_order + 1
@@ -1176,13 +1183,11 @@ def eval_val_sliding(
                     n_seg = len(seg_nll_np)
                     global_j = np.arange(ws + s + 1, ws + wlen + 1, dtype=np.int64)
 
-                    # Entropy-adaptive alpha: compute from model logits (GPU)
+                    # OAEG entropy-adaptive alpha with per-order center shifts
                     if ngram_entropy:
                         with torch.no_grad():
                             lp = F.log_softmax(logits[i, s:wlen].float(), dim=-1)
                             seg_ent = -(lp.exp() * lp).sum(dim=-1).cpu().numpy()
-                        alpha_per_tok = ngram_ent_base + ngram_ent_range / (
-                            1.0 + np.exp(-ngram_ent_scale * (seg_ent - ngram_ent_thresh)))
 
                     # Precompute hashes for all orders
                     order_data = []  # (v_idx, ctx_key, full_key) per order
@@ -1218,11 +1223,31 @@ def eval_val_sliding(
                             p = np.minimum(full_counts[needs_fill], ctx_counts[needs_fill]) / np.maximum(ctx_counts[needs_fill], 1.0)
                             best_p_ng[fill_idx] = np.clip(p, 0.0, 1.0)
 
-                    # Mix model probability with n-gram
+                    # OAEG mix: per-order alpha with center shifts and multipliers
                     has_match = best_p_ng >= 0
+                    best_order_idx = np.full(n_seg, -1)  # track which order won
+                    for oi in range(_n_orders - 1, -1, -1):
+                        if order_data[oi] is None:
+                            continue
+                        v_idx, ctx_key, full_key = order_data[oi]
+                        ctx_counts = ctx_tables[oi][ctx_key].astype(np.float64)
+                        matched = ctx_counts >= float(ngram_min_count)
+                        filled = matched & (best_order_idx[v_idx] < 0)
+                        if filled.any():
+                            best_order_idx[v_idx[filled]] = oi
+
                     if has_match.any():
                         if ngram_entropy:
-                            alpha = alpha_per_tok[has_match]
+                            oi_per_tok = best_order_idx[has_match]
+                            center_per_tok = ngram_ent_thresh - ngram_center_shift * oi_per_tok
+                            alpha = ngram_ent_base + ngram_ent_range / (
+                                1.0 + np.exp(-ngram_ent_scale * (seg_ent[has_match] - center_per_tok)))
+                            for oi in range(len(ngram_order_mults)):
+                                mask = oi_per_tok == oi
+                                if mask.any():
+                                    mult = ngram_order_mults[oi] if oi < len(ngram_order_mults) else 2.0
+                                    alpha[mask] *= mult
+                            alpha = np.clip(alpha, 0.0, 0.95)
                         else:
                             alpha = ngram_alpha
                         seg_model_p[has_match] = (1.0 - alpha) * seg_model_p[has_match] + alpha * best_p_ng[has_match]
@@ -1254,8 +1279,92 @@ def eval_val_sliding(
     val_loss = (loss_sum / token_count).item()
     bits_per_token = val_loss / math.log(2.0)
     tokens_per_byte = token_count.item() / byte_count.item()
+    val_bpb_pass1 = bits_per_token * tokens_per_byte
+
+    # two-pass rescore: use the fully-built cache to rescore all tokens
+    if use_ngram and ngram_two_pass and rank == 0:
+        print(f"two_pass:starting pass2 with complete cache", flush=True)
+        t2_start = time.time()
+        total = val_tokens.numel() - 1
+
+        # rebuild all hashes for every position, lookup in complete cache
+        pass2_loss = 0.0
+        pass2_bytes = 0.0
+        pass2_count = 0
+
+        # we need the stored model probabilities from pass 1
+        # recompute via sliding window (same as pass 1 but faster — no cache update)
+        scored_p = np.zeros(total, dtype=np.float64)
+        scored_ent = np.zeros(total, dtype=np.float64)
+        scored_bytecost = np.zeros(total, dtype=np.float64)
+
+        with torch.inference_mode():
+            for wi, ws in enumerate(my_windows):
+                wlen = min(ws + seq_len, total) - ws
+                if wlen < 2:
+                    continue
+                x_batch = val_tokens[ws:ws + wlen].unsqueeze(0).to(device)
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                    lo = compiled_logits(x_batch)
+                lo_f = lo.float()
+                y_batch = val_tokens[ws + 1:ws + wlen + 1].to(device).long()
+                nll = F.cross_entropy(lo_f[0, :wlen - 1], y_batch[:wlen - 1], reduction="none")
+                with torch.no_grad():
+                    lp = F.log_softmax(lo_f[0, :wlen - 1], dim=-1)
+                    ent = -(lp.exp() * lp).sum(dim=-1).cpu().numpy()
+                nll_np = nll.cpu().numpy().astype(np.float64)
+                for j in range(len(nll_np)):
+                    pos = ws + 1 + j
+                    if pos < total and scored_p[pos] == 0:
+                        scored_p[pos] = np.exp(-nll_np[j])
+                        scored_ent[pos] = ent[j]
+                        tgt = int(val_np[pos])
+                        prev = int(val_np[pos - 1]) if pos > 0 else 0
+                        b = float(base_bytes_lut[tgt].item())
+                        if has_leading_space_lut[tgt].item() and not is_boundary_token_lut[prev].item():
+                            b += 1.0
+                        scored_bytecost[pos] = b
+
+        # now rescore every position using the complete cache
+        for t in range(1, total):
+            if scored_p[t] <= 0 or scored_bytecost[t] <= 0:
+                continue
+            p_model = scored_p[t]
+            p_final = p_model
+            for oi in range(_n_orders - 1, -1, -1):
+                ctx_w = ngram_min_order + oi - 1
+                if t < ctx_w:
+                    continue
+                ctx_hash = np.uint64(0)
+                for k in range(ctx_w):
+                    ctx_hash ^= np.uint64(val_np[t - (ctx_w - k)]) * ng_primes[k % len(ng_primes)]
+                ctx_key = int(ctx_hash & ng_mask)
+                tgt_hash = ctx_hash ^ (np.uint64(val_np[t]) * ng_primes[ctx_w % len(ng_primes)])
+                full_key = int(tgt_hash & ng_mask)
+
+                cc = float(ctx_tables[oi][ctx_key])
+                fc = float(full_tables[oi][full_key])
+                if cc >= float(ngram_min_count) and fc > 0:
+                    p_ng = min(fc, cc) / max(cc, 1.0)
+                    center = ngram_ent_thresh - ngram_center_shift * oi
+                    alpha = ngram_ent_base + ngram_ent_range / (1.0 + math.exp(-ngram_ent_scale * (scored_ent[t] - center)))
+                    mult = ngram_order_mults[oi] if oi < len(ngram_order_mults) else 2.0
+                    alpha = min(alpha * mult, 0.95)
+                    p_final = (1.0 - alpha) * p_model + alpha * p_ng
+                    break
+
+            pass2_loss += -math.log(max(p_final, 1e-12)) * scored_bytecost[t]
+            pass2_bytes += scored_bytecost[t]
+            pass2_count += 1
+
+        if pass2_bytes > 0:
+            pass2_bpb = (pass2_loss / pass2_bytes) / math.log(2.0)
+            print(f"two_pass:done pass2_bpb={pass2_bpb:.4f} tokens={pass2_count:,} time={time.time()-t2_start:.0f}s", flush=True)
+            base_model.train()
+            return val_loss, pass2_bpb
+
     base_model.train()
-    return val_loss, bits_per_token * tokens_per_byte
+    return val_loss, val_bpb_pass1
 
 
 # -----------------------------
