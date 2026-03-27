@@ -1313,8 +1313,8 @@ def eval_val_sliding(
                         p_hedge = hedge_w[0] * p_neural_raw + hedge_w[1] * p_mixed
                         seg_nll_np = -np.log(np.clip(p_hedge, 1e-12, 1.0))
                         # update hedge weights (score-first: based on what we just scored)
-                        hedge_losses[0] += -np.log(np.clip(p_neural_raw, 1e-12, 1.0)).sum()
-                        hedge_losses[1] += -np.log(np.clip(p_mixed, 1e-12, 1.0)).sum()
+                        hedge_losses[0] += float(-np.log(np.clip(p_neural_raw, 1e-12, 1.0)).mean())
+                        hedge_losses[1] += float(-np.log(np.clip(p_mixed, 1e-12, 1.0)).mean())
                         raw_w = np.exp(-hedge_beta * (hedge_losses - hedge_losses.min()))
                         hedge_w = raw_w / raw_w.sum()
                     else:
