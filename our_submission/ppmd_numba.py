@@ -8,7 +8,7 @@ PRIMES = np.array([36313, 27191, 51647, 81929, 131071, 175447, 209591], dtype=np
 
 @njit(cache=True)
 def ppmd_update_batch(val_np, start, end, n_orders, min_order, primes, mask,
-                      ctx_tables, full_tables, unique_tables):
+                      ctx_tables, full_tables, unique_tables, singleton_tables):
     for j in range(start, end):
         nt = np.uint64(val_np[j])
         for oi in range(n_orders):
@@ -22,17 +22,28 @@ def ppmd_update_batch(val_np, start, end, n_orders, min_order, primes, mask,
             pidx = min(ctx_len, len(primes) - 1)
             fk = ck ^ (primes[pidx] * nt)
             fk &= mask
-            if full_tables[oi][fk] == 0:
+
+            fc = full_tables[oi][fk]
+            if fc == 0:
+                # new (context, token) pair — both unique and singleton
                 if unique_tables[oi][ck] < 65535:
                     unique_tables[oi][ck] += 1
+                if singleton_tables[oi][ck] < 65535:
+                    singleton_tables[oi][ck] += 1
+            elif fc == 1:
+                # was singleton, now seen twice — no longer singleton
+                if singleton_tables[oi][ck] > 0:
+                    singleton_tables[oi][ck] -= 1
+
             ctx_tables[oi][ck] += 1
             full_tables[oi][fk] += 1
 
 
 @njit(cache=True, parallel=True)
 def ppmd_predict_batch(val_np, global_j, n_seg, n_orders, min_order, min_count,
-                       primes, mask, ctx_tables, full_tables, unique_tables,
-                       depth_boost):
+                       primes, mask, ctx_tables, full_tables,
+                       unique_tables, singleton_tables,
+                       depth_boost, use_singleton_escape):
     p_out = np.zeros(n_seg, dtype=np.float64)
     has = np.zeros(n_seg, dtype=np.bool_)
 
@@ -58,11 +69,20 @@ def ppmd_predict_batch(val_np, global_j, n_seg, n_orders, min_order, min_count,
             fk = ck ^ (primes[pidx] * nt)
             fk &= mask
             fc = float(full_tables[oi][fk])
-            uc = float(unique_tables[oi][ck])
 
             p = min(fc, cc) / max(cc, 1.0)
             p = max(0.0, min(1.0, p))
-            esc = uc / (cc + uc + 1e-10)
+
+            if use_singleton_escape:
+                # PPM-D: escape = q1 / (2 * total)
+                q1 = float(singleton_tables[oi][ck])
+                esc = q1 / (2.0 * cc + 1e-10)
+            else:
+                # PPM-C: escape = unique / (total + unique)
+                uc = float(unique_tables[oi][ck])
+                esc = uc / (cc + uc + 1e-10)
+
+            esc = max(0.0, min(1.0, esc))
             w = (1.0 - esc) * depth_boost[oi]
             wp += w * p
             tw += w
@@ -77,7 +97,7 @@ def ppmd_predict_batch(val_np, global_j, n_seg, n_orders, min_order, min_count,
 
 class PPMDNumba:
     def __init__(self, max_order=7, min_order=2, num_buckets=4_194_304,
-                 min_count=2, depth_boost_base=2.0):
+                 min_count=2, depth_boost_base=2.0, use_singleton_escape=True):
         assert max_order <= len(PRIMES), f"max_order {max_order} > {len(PRIMES)} primes"
         assert num_buckets & (num_buckets - 1) == 0
         self.max_order = max_order
@@ -87,14 +107,17 @@ class PPMDNumba:
         self.n_orders = max_order - min_order + 1
         self.mask = np.uint64(num_buckets - 1)
         self.primes = PRIMES[:max_order].copy()
+        self.use_singleton_escape = use_singleton_escape
 
         self.ctx_tables = NumbaList()
         self.full_tables = NumbaList()
         self.unique_tables = NumbaList()
+        self.singleton_tables = NumbaList()
         for _ in range(self.n_orders):
             self.ctx_tables.append(np.zeros(num_buckets, dtype=np.uint32))
             self.full_tables.append(np.zeros(num_buckets, dtype=np.uint32))
             self.unique_tables.append(np.zeros(num_buckets, dtype=np.uint16))
+            self.singleton_tables.append(np.zeros(num_buckets, dtype=np.uint16))
 
         self.depth_boost = np.array(
             [depth_boost_base ** i for i in range(self.n_orders)], dtype=np.float64)
@@ -103,11 +126,13 @@ class PPMDNumba:
         return ppmd_predict_batch(
             val_np, global_j, n_seg, self.n_orders, self.min_order,
             self.min_count, self.primes, self.mask,
-            self.ctx_tables, self.full_tables, self.unique_tables,
-            self.depth_boost)
+            self.ctx_tables, self.full_tables,
+            self.unique_tables, self.singleton_tables,
+            self.depth_boost, self.use_singleton_escape)
 
     def update_tables(self, val_np, start, end):
         ppmd_update_batch(
             val_np, start, end, self.n_orders, self.min_order,
             self.primes, self.mask,
-            self.ctx_tables, self.full_tables, self.unique_tables)
+            self.ctx_tables, self.full_tables,
+            self.unique_tables, self.singleton_tables)
