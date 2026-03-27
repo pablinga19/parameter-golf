@@ -986,12 +986,10 @@ class GPT(nn.Module):
         comp_weight = float(os.environ.get("COMP_WEIGHT", "0"))
         if comp_weight > 0 and hasattr(self, '_bigram_dominant') and self._bigram_dominant is not None:
             per_tok = F.cross_entropy(logits.float(), targets, reduction="none")
-            input_flat = input_ids.reshape(-1)
-            prev_tokens = input_flat
-            curr_targets = targets
-            # check which tokens match the dominant bigram continuation
-            dom = self._bigram_dominant[prev_tokens.long()]
-            easy = (dom == curr_targets).float()
+            # use x (input) as prev tokens, y (target) as current — already aligned
+            prev_tokens = input_ids.reshape(-1)
+            dom = self._bigram_dominant[prev_tokens.clamp(0, len(self._bigram_dominant) - 1).long()]
+            easy = (dom == targets).float()
             # easy tokens get weight 1/comp_weight, hard get comp_weight
             w = torch.where(easy > 0.5, 1.0 / comp_weight, comp_weight)
             w = w / w.mean()  # normalize
@@ -1103,15 +1101,21 @@ def eval_val_sliding(
             with open(warm_cache_path, 'rb') as f:
                 raw = zstandard.ZstdDecompressor().decompress(f.read())
             bpt = ngram_buckets * 4
-            ctx_tables = []
-            full_tables = []
-            off = 0
-            for _ in range(_n_orders):
-                ctx_tables.append(np.frombuffer(raw[off:off+bpt], dtype=np.uint32).copy())
-                off += bpt
-                full_tables.append(np.frombuffer(raw[off:off+bpt], dtype=np.uint32).copy())
-                off += bpt
-            print(f"warm_cache:loaded {warm_cache_path} ({len(raw)//1e6:.1f}MB decompressed)", flush=True)
+            expected_size = _n_orders * 2 * bpt
+            if len(raw) != expected_size:
+                print(f"warm_cache:SKIP size mismatch (got {len(raw)}, expected {expected_size} for {_n_orders} orders, {ngram_buckets} buckets)", flush=True)
+                ctx_tables = [np.zeros((ngram_buckets,), dtype=np.uint32) for _ in range(_n_orders)]
+                full_tables = [np.zeros((ngram_buckets,), dtype=np.uint32) for _ in range(_n_orders)]
+            else:
+                ctx_tables = []
+                full_tables = []
+                off = 0
+                for _ in range(_n_orders):
+                    ctx_tables.append(np.frombuffer(raw[off:off+bpt], dtype=np.uint32).copy())
+                    off += bpt
+                    full_tables.append(np.frombuffer(raw[off:off+bpt], dtype=np.uint32).copy())
+                    off += bpt
+                print(f"warm_cache:loaded {warm_cache_path} ({len(raw)/1e6:.1f}MB)", flush=True)
         else:
             ctx_tables = [np.zeros((ngram_buckets,), dtype=np.uint32) for _ in range(_n_orders)]
             full_tables = [np.zeros((ngram_buckets,), dtype=np.uint32) for _ in range(_n_orders)]
