@@ -1106,6 +1106,19 @@ def eval_val_sliding(
     hedge_losses = np.zeros(2)
     phrase_lengths = [64, 56, 48, 36, 28, 20, 16]
     phrase_tables = {L: {} for L in phrase_lengths} if use_phrase_cache else {}
+    # skip-gram tables for non-contiguous patterns
+    use_skip_grams = bool(int(os.environ.get("SKIP_GRAMS", "0")))
+    skip_patterns = [([1, 3], 4_194_304), ([1, 2, 4], 4_194_304),
+                     ([1, 3, 5], 4_194_304), ([1, 10], 4_194_304), ([1, 20], 4_194_304)]
+    skip_primes = np.array([36313, 27191, 51647, 73121, 98317, 131071], dtype=np.uint64)
+    skip_alpha_mults = [0.70, 0.55, 0.45, 0.35, 0.30]
+    skip_tables = []
+    # document cache LM
+    use_cache_lm = bool(int(os.environ.get("CACHE_LM", "0")))
+    cache_lm_size = int(os.environ.get("CACHE_LM_SIZE", "1000"))
+    cache_lm_lambda = float(os.environ.get("CACHE_LM_LAMBDA", "0.12"))
+    # KN continuation counts (built during two-pass)
+    use_kn_unigram = bool(int(os.environ.get("KN_UNIGRAM", "0")))
     if use_ngram:
         val_np = val_tokens.cpu().numpy()
         _n_orders = ngram_order - ngram_min_order + 1
@@ -1440,6 +1453,73 @@ def eval_val_sliding(
             p_model_hi = scored_model_p[positions[hi]]
             p_final[hi] = (1.0 - alpha) * p_model_hi + alpha * p_ng
             matched[hi] = True
+
+        # skip-gram scoring for unmatched tokens
+        if use_skip_grams and not matched.all():
+            print(f"two_pass:building skip-gram tables...", flush=True)
+            for offsets, nbuckets in skip_patterns:
+                max_off = max(offsets)
+                smask = nbuckets - 1
+                N = len(val_np)
+                if N <= max_off:
+                    skip_tables.append((offsets, None, None, nbuckets))
+                    continue
+                positions_s = np.arange(max_off, N)
+                h = np.zeros(len(positions_s), dtype=np.int64)
+                for j, off in enumerate(offsets):
+                    h ^= int(skip_primes[j]) * val_np[positions_s - off].astype(np.int64)
+                ctx_b = (h & smask).astype(np.int32)
+                full_h = h ^ int(skip_primes[len(offsets)]) * val_np[positions_s].astype(np.int64)
+                full_b = (full_h & smask).astype(np.int32)
+                cc = np.bincount(ctx_b, minlength=nbuckets).astype(np.float32)
+                fc = np.bincount(full_b, minlength=nbuckets).astype(np.float32)
+                skip_tables.append((offsets, cc, fc, nbuckets))
+
+            unmatched = np.nonzero(~matched)[0]
+            for si, (offsets, cc, fc, nb) in enumerate(skip_tables):
+                if cc is None:
+                    continue
+                max_off = max(offsets)
+                smask = nb - 1
+                for ui in unmatched:
+                    pos = int(positions[ui])
+                    if pos < max_off:
+                        continue
+                    h = 0
+                    for j, off in enumerate(offsets):
+                        h ^= int(skip_primes[j]) * int(val_np[pos - off])
+                    cb = h & smask
+                    if cc[cb] < ngram_min_count:
+                        continue
+                    fh = (h ^ int(skip_primes[len(offsets)]) * int(val_np[pos])) & smask
+                    if fc[fh] > 0:
+                        p_skip = float(fc[fh]) / float(cc[cb])
+                        a_skip = 0.3 * skip_alpha_mults[si]
+                        p_final[ui] = (1.0 - a_skip) * p_final[ui] + a_skip * p_skip
+                        matched[ui] = True
+                        break
+            print(f"two_pass:skip-grams done, matched={matched.sum():,}/{total:,}", flush=True)
+
+        # KN unigram continuation counts (replaces raw unigram for unmatched tokens)
+        if use_kn_unigram:
+            vocab_size = int(val_np.max()) + 1
+            left_ctx_count = np.zeros(vocab_size, dtype=np.int32)
+            v = val_np[:-1].astype(np.int64)
+            w = val_np[1:].astype(np.int64)
+            pair_h = ((v * int(ng_primes[0])) ^ (w * int(ng_primes[1]))) % (ngram_buckets * 4)
+            order = np.argsort(pair_h)
+            pair_sorted = pair_h[order]
+            w_sorted = w[order]
+            is_new = np.concatenate([[True], pair_sorted[1:] != pair_sorted[:-1]])
+            w_new = w_sorted[is_new].astype(np.int32) % vocab_size
+            np.add.at(left_ctx_count, w_new, 1)
+            total_lc = max(int(left_ctx_count.sum()), 1)
+            # for unmatched tokens, use KN unigram as a soft floor
+            unmatched = ~matched
+            if unmatched.any():
+                tgt_unmatched = val_np[positions[unmatched]].astype(np.int32) % vocab_size
+                kn_p = left_ctx_count[tgt_unmatched].astype(np.float64) / total_lc
+                p_final[unmatched] = np.maximum(p_final[unmatched], kn_p * 0.01)
 
         # compute BPB
         valid_mask = (p_final > 0) & (bytecost > 0)
